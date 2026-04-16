@@ -1,720 +1,896 @@
+// Compile the program
+// javac -cp "../../../lwjgl-release-3.3.6-custom/*" Simulation.java
+// Run the program
+// java -cp ".;../../../lwjgl-release-3.3.6-custom/*" Simulation
+
 import org.lwjgl.glfw.*;
 import org.lwjgl.opengl.*;
 import org.lwjgl.system.*;
+import org.lwjgl.stb.STBImage;
 
 import java.nio.*;
+import java.io.*;
+import java.util.*;
 
 import static org.lwjgl.glfw.Callbacks.*;
 import static org.lwjgl.glfw.GLFW.*;
 import static org.lwjgl.opengl.GL41C.*;
+import static org.lwjgl.stb.STBImage.*;
 import static org.lwjgl.system.MemoryStack.*;
 import static org.lwjgl.system.MemoryUtil.*;
 
+// Audio
+import org.lwjgl.openal.*;
+import static org.lwjgl.openal.AL10.*;
+import static org.lwjgl.openal.ALC10.*;
+import org.lwjgl.stb.STBVorbis;
+import javax.sound.sampled.*;
+import java.io.File;
+
 public class Simulation {
+  private static final int   WIDTH  = 1280;
+  private static final int   HEIGHT = 720;
+  private static final float FOV    = 0.4663f;
 
-    private static final int WIDTH  = 1280;
-    private static final int HEIGHT = 720;
-    private static final float FOV  = 0.4663f;
+  private long window;
+  private int planetProg, sunProg, gridProg, platformProg;
+  private int texMustafar, texKashyyyk, texPlatform;
+  private int sunVAO, sunVBO, sunEBO, sunIndexCount;
 
-    private long   window;
-    private int    prog, vao, vbo;
-    private double startTime;
+  // Audio
+  private long audioDevice;
+  private long audioContext;
+  private int musicSource;
+  private IntBuffer musicBuffer;
+  private boolean audioInitialized = false;
+  private Clip backgroundMusic;
 
-    private float  camX = 0, camY = 2, camZ = 30;
-    private float  yaw  = 0, pitch = 0;
+  // Planet meshes
+  private int mustafarVAO, mustafarIndexCount;
+  private int kashyyykVAO, kashyyykIndexCount;
 
-    private boolean wDown, aDown, sDown, dDown, spDown, shDown;
-    private boolean locked = false;
-    private double  lastMouseX, lastMouseY;
-    private boolean firstMouse = true;
+  // Platform mesh
+  private int platformVAO, platformIndexCount;
+  private float platformY = -12.0f;
 
-    public void run() { init(); loop(); cleanup(); }
+  // Grid mesh
+  private int gridVAO, gridIndexCount;
 
-    private static final String VERT = """
+  // Planet positions and rotations
+  private float musX = 9.0f,  musZ = 0.0f;
+  private float kasX = 16.5f, kasZ = 0.0f;
+  private double orbitAngleMus = 0.0;
+  private double orbitAngleKas = 2.1;
+  private float musRotation = 0.0f;
+  private float kasRotation = 0.0f;
+
+  private double startTime;
+
+  private float camX = 0, camY = 5, camZ = 25;
+  private float yaw = 0, pitch = -0.2f;
+
+  private boolean wDown, aDown, sDown, dDown, spDown, shDown;
+  private boolean locked = false;
+  private double lastMouseX, lastMouseY;
+  private boolean firstMouse = true;
+
+  public void run() { init(); loop(); cleanup(); }
+
+  // -------------------------------------------------------------------------
+  // Shaders
+  // -------------------------------------------------------------------------
+
+  private static final String VERT_PLANET = """
 #version 410 core
-        layout(location=0) in vec2 p;
-    void main(){ gl_Position=vec4(p,0,1); }
-    """;
+    layout(location=0) in vec3 aPos;
+  layout(location=1) in vec2 aTexCoord;
 
-    private static final String FRAG = """
+  uniform mat4 uModel;
+  uniform mat4 uView;
+  uniform mat4 uProjection;
+
+  out vec2 TexCoord;
+  out vec3 FragPos;
+
+  void main() {
+    TexCoord    = aTexCoord;
+    FragPos     = vec3(uModel * vec4(aPos, 1.0));
+    gl_Position = uProjection * uView * vec4(FragPos, 1.0);
+  }
+  """;
+
+  private static final String FRAG_PLANET = """
 #version 410 core
-        out vec4 frag;
-    uniform vec2  uRes;
-    uniform float uTime;
-    uniform vec3  uCamPos;
-    uniform float uYaw;
-    uniform float uPitch;
-    uniform float uFOV;
+    out vec4 frag;
 
-    float hash(float n){ return fract(sin(n)*43758.5453); }
-    float hash2(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
-    float hash3(vec3 p){ return fract(sin(dot(p,vec3(127.1,311.7,74.7)))*43758.5453); }
+  in vec2 TexCoord;
+  in vec3 FragPos;
 
-    float vnoise(vec3 p){
-        vec3 i=floor(p), f=fract(p);
-        f=f*f*(3.-2.*f);
-        float n=i.x+i.y*57.+113.*i.z;
-        return mix(
-                mix(mix(hash(n),      hash(n+1.),  f.x), mix(hash(n+57.), hash(n+58.), f.x), f.y),
-                mix(mix(hash(n+113.), hash(n+114.),f.x), mix(hash(n+170.),hash(n+171.),f.x), f.y), f.z);
+  uniform sampler2D uTexture;
+  uniform vec3  uSunPos;
+  uniform vec3  uPlanetCenter;
+  uniform vec3  uViewPos;
+  uniform float uTime;
+
+  void main() {
+    vec2 animatedUV = TexCoord;
+    animatedUV.x += uTime * 0.05;
+    vec4 texColor = texture(uTexture, animatedUV);
+
+    vec3 N = normalize(FragPos - uPlanetCenter);
+    vec3 L = normalize(uSunPos - FragPos);
+    vec3 V = normalize(uViewPos - FragPos);
+    vec3 R = reflect(-L, N);
+
+    float ambient = 0.05;
+    float diff    = max(dot(N, L), 0.0);
+    float spec    = pow(max(dot(V, R), 0.0), 32.0) * 0.4;
+    float rim     = pow(1.0 - max(dot(V, N), 0.0), 2.0) * 0.15 * diff;
+
+    vec3 lit = texColor.rgb * (ambient + diff)
+      + vec3(0.8, 0.7, 0.5) * spec
+      + vec3(0.3, 0.2, 0.1) * rim;
+
+    frag = vec4(lit * 1.1, 1.0);
+  }
+  """;
+
+  private static final String VERT_PLATFORM = """
+#version 410 core
+    layout(location=0) in vec3 aPos;
+  layout(location=1) in vec2 aTexCoord;
+
+  uniform mat4 uModel;
+  uniform mat4 uView;
+  uniform mat4 uProjection;
+
+  out vec2 TexCoord;
+  out vec3 FragPos;
+
+  void main() {
+    TexCoord    = aTexCoord;
+    FragPos     = vec3(uModel * vec4(aPos, 1.0));
+    gl_Position = uProjection * uView * vec4(FragPos, 1.0);
+  }
+  """;
+
+  private static final String FRAG_PLATFORM = """
+#version 410 core
+    out vec4 frag;
+
+  in vec2 TexCoord;
+  in vec3 FragPos;
+
+  uniform sampler2D uTexture;
+  uniform vec3  uSunPos;
+  uniform vec3  uViewPos;
+  uniform float uTime;
+
+  void main() {
+    vec2 animatedUV = TexCoord;
+    animatedUV.x += uTime * 0.02;
+    animatedUV.y += uTime * 0.01;
+    vec4 texColor = texture(uTexture, animatedUV);
+
+    vec3 N = vec3(0.0, 1.0, 0.0);
+    vec3 L = normalize(uSunPos - FragPos);
+    vec3 V = normalize(uViewPos - FragPos);
+    vec3 R = reflect(-L, N);
+
+    float ambient = 0.3;
+    float diff    = max(dot(N, L), 0.1);
+    float spec    = pow(max(dot(V, R), 0.0), 64.0) * 0.3;
+
+    vec3 lit = texColor.rgb * (ambient + diff) + vec3(0.6, 0.6, 0.8) * spec;
+    frag = vec4(lit, 1.0);
+  }
+  """;
+
+  private static final String VERT_SUN = """
+#version 410 core
+    layout(location=0) in vec3 aPos;
+
+  uniform mat4  uModel;
+  uniform mat4  uView;
+  uniform mat4  uProjection;
+  uniform float uTime;
+
+  out vec3 FragPos;
+
+  void main() {
+    FragPos     = vec3(uModel * vec4(aPos, 1.0));
+    gl_Position = uProjection * uView * vec4(FragPos, 1.0);
+  }
+  """;
+
+  private static final String FRAG_SUN = """
+#version 410 core
+    out vec4 frag;
+
+  in vec3  FragPos;
+  uniform float uTime;
+
+  void main() {
+    float pulse  = 0.8 + 0.2 * sin(uTime * 2.0);
+    vec3 sunColor = vec3(1.0, 0.7, 0.3) * pulse;
+    sunColor += vec3(0.2, 0.1, 0.0) * sin(FragPos.xyx * 10.0 + uTime * 5.0);
+    frag = vec4(sunColor, 1.0);
+  }
+  """;
+
+  private static final String VERT_GRID = """
+#version 410 core
+    layout(location=0) in vec3 aPos;
+
+  uniform mat4 uView;
+  uniform mat4 uProjection;
+  uniform vec3 uCamPos;
+
+  out float Alpha;
+
+  void main() {
+    vec4 worldPos = vec4(aPos, 1.0);
+    vec4 viewPos = uView * worldPos;
+    gl_Position = uProjection * viewPos;
+
+    Alpha = 1.0;
+  }
+  """;
+
+  private static final String FRAG_GRID = """
+#version 410 core
+    out vec4 frag;
+
+  in float Alpha;
+
+  void main() {
+    frag = vec4(0.9, 0.9, 1.0, 1.0);
+  }
+  """;
+
+  // -------------------------------------------------------------------------
+  // Geometry generation
+  // -------------------------------------------------------------------------
+
+  private void generateSun() {
+    List<Float>   vertices = new ArrayList<>();
+    List<Integer> indices  = new ArrayList<>();
+
+    int   latSeg = 32, lonSeg = 32;
+    float radius = 2.0f;
+
+    for (int i = 0; i <= latSeg; i++) {
+      float theta = (float) i * (float) Math.PI / latSeg;
+      float sinT  = (float) Math.sin(theta);
+      float cosT  = (float) Math.cos(theta);
+      for (int j = 0; j <= lonSeg; j++) {
+        float phi  = (float) j * 2.0f * (float) Math.PI / lonSeg;
+        vertices.add(radius * sinT * (float) Math.cos(phi));
+        vertices.add(radius * cosT);
+        vertices.add(radius * sinT * (float) Math.sin(phi));
+      }
     }
-    float fbm(vec3 p, int o){
-        float v=0.,a=.5,q=1.;
-        for(int i=0;i<o;i++){v+=a*vnoise(p*q);a*=.5;q*=2.;}
-        return v;
+    for (int i = 0; i < latSeg; i++) {
+      for (int j = 0; j < lonSeg; j++) {
+        int first  = i * (lonSeg + 1) + j;
+        int second = first + lonSeg + 1;
+        indices.add(first);  indices.add(second);    indices.add(first + 1);
+        indices.add(second); indices.add(second + 1); indices.add(first + 1);
+      }
     }
 
-    // ── Starfield ──────────────────────────────────────────────────────────────
-    vec3 starfield(vec3 rd, float time) {
-        vec3 col = vec3(0.);
+    float[] va = new float[vertices.size()];
+    for (int i = 0; i < va.length; i++) va[i] = vertices.get(i);
+    int[]   ia = new int[indices.size()];
+    for (int i = 0; i < ia.length; i++) ia[i] = indices.get(i);
 
-        for (int layer = 0; layer < 3; layer++) {
-            float scale  = 200.0 + float(layer) * 180.0;
-            float bright = 1.0   - float(layer) * 0.28;
+    sunVAO = glGenVertexArrays();
+    sunVBO = glGenBuffers();
+    sunEBO = glGenBuffers();
+    glBindVertexArray(sunVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, sunVBO);
+    glBufferData(GL_ARRAY_BUFFER, va, GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sunEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, ia, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, false, 3 * Float.BYTES, 0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
 
-            vec3 ar = abs(rd);
-            vec2 uv;
-            float face;
-            if (ar.x >= ar.y && ar.x >= ar.z) {
-                uv   = rd.yz / ar.x;
-                face = rd.x > 0. ? 0. : 1.;
-            } else if (ar.y >= ar.x && ar.y >= ar.z) {
-                uv   = rd.xz / ar.y;
-                face = rd.y > 0. ? 2. : 3.;
+    sunIndexCount = ia.length;
+  }
+
+  private void generateGrid() {
+    List<Float>   vertices = new ArrayList<>();
+    List<Integer> indices  = new ArrayList<>();
+
+    float gridSize = 60.0f, step = 2.0f, y = -10.0f;
+    int   vc = 0;
+
+    for (float z = -gridSize; z <= gridSize; z += step) {
+      vertices.add(-gridSize); vertices.add(y); vertices.add(z);
+      vertices.add( gridSize); vertices.add(y); vertices.add(z);
+      indices.add(vc); indices.add(vc + 1); vc += 2;
+    }
+    for (float x = -gridSize; x <= gridSize; x += step) {
+      vertices.add(x); vertices.add(y); vertices.add(-gridSize);
+      vertices.add(x); vertices.add(y); vertices.add( gridSize);
+      indices.add(vc); indices.add(vc + 1); vc += 2;
+    }
+
+    float[] va = new float[vertices.size()];
+    for (int i = 0; i < va.length; i++) va[i] = vertices.get(i);
+    int[]   ia = new int[indices.size()];
+    for (int i = 0; i < ia.length; i++) ia[i] = indices.get(i);
+
+    gridVAO = glGenVertexArrays();
+    int gridVBO = glGenBuffers();
+    int gridEBO = glGenBuffers();
+    glBindVertexArray(gridVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, gridVBO);
+    glBufferData(GL_ARRAY_BUFFER, va, GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gridEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, ia, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, false, 3 * Float.BYTES, 0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
+    gridIndexCount = ia.length;
+  }
+
+  // -------------------------------------------------------------------------
+  // OBJ loader
+  // -------------------------------------------------------------------------
+
+  private static class MeshData {
+    List<Float>   vertices  = new ArrayList<>();
+    List<Float>   texCoords = new ArrayList<>();
+    List<Integer> indices   = new ArrayList<>();
+  }
+
+  private MeshData loadOBJ(String path) {
+    MeshData mesh = new MeshData();
+    try (BufferedReader reader = new BufferedReader(new FileReader(path))) {
+      String line;
+      List<Float> tv = new ArrayList<>(), tt = new ArrayList<>();
+      while ((line = reader.readLine()) != null) {
+        if (line.startsWith("v ")) {
+          String[] p = line.split("\\s+");
+          tv.add(Float.parseFloat(p[1]));
+          tv.add(Float.parseFloat(p[2]));
+          tv.add(Float.parseFloat(p[3]));
+        } else if (line.startsWith("vt ")) {
+          String[] p = line.split("\\s+");
+          tt.add(Float.parseFloat(p[1]));
+          tt.add(1.0f - Float.parseFloat(p[2]));
+        } else if (line.startsWith("f ")) {
+          String[] p = line.split("\\s+");
+          for (int i = 1; i <= 3; i++) {
+            String[] vd  = p[i].split("/");
+            int      vi  = Integer.parseInt(vd[0]) - 1;
+            mesh.vertices.add(tv.get(vi * 3));
+            mesh.vertices.add(tv.get(vi * 3 + 1));
+            mesh.vertices.add(tv.get(vi * 3 + 2));
+            if (vd.length > 1 && !vd[1].isEmpty()) {
+              int ti = Integer.parseInt(vd[1]) - 1;
+              mesh.texCoords.add(tt.get(ti * 2));
+              mesh.texCoords.add(tt.get(ti * 2 + 1));
             } else {
-                uv   = rd.xy / ar.z;
-                face = rd.z > 0. ? 4. : 5.;
+              mesh.texCoords.add(0.0f);
+              mesh.texCoords.add(0.0f);
             }
-
-            vec2 cell = floor(uv * scale + face * 1000.0);
-            vec2 offs = fract(uv * scale + face * 1000.0);
-
-            for (int dy = -1; dy <= 1; dy++) {
-                for (int dx = -1; dx <= 1; dx++) {
-                    vec2  nc   = cell + vec2(float(dx), float(dy));
-                    float h1   = hash2(nc);
-                    float h2   = hash2(nc + 37.3);
-                    float h3   = hash2(nc + 91.7);
-                    float h4   = hash2(nc + 153.1);
-
-                    vec2 starPos = vec2(h1, h2);
-                    float exist = step(0.78, h3);
-                    if (exist < 0.5) continue;
-
-                    vec2  delta = offs - starPos - vec2(float(dx), float(dy));
-                    float dist  = length(delta);
-                    float mag   = pow(h4, 2.2);
-                    float radius = mix(0.003, 0.0004, mag);
-                    float glow  = exp(-dist * dist / (radius * radius * 8.0));
-                    float core  = exp(-dist * dist / (radius * radius * 0.8));
-
-                    float colorH = hash2(nc + 200.5);
-                    vec3 starCol;
-                    if      (colorH < 0.04) starCol = vec3(0.65, 0.75, 1.00);
-                    else if (colorH < 0.12) starCol = vec3(0.80, 0.88, 1.00);
-                    else if (colorH < 0.30) starCol = vec3(1.00, 1.00, 1.00);
-                    else if (colorH < 0.55) starCol = vec3(1.00, 0.97, 0.82);
-                    else if (colorH < 0.78) starCol = vec3(1.00, 0.85, 0.55);
-                    else                    starCol = vec3(1.00, 0.55, 0.35);
-
-                    float twinkleRate = mix(1.8, 0.6, mag);
-                    float twinkle     = 0.85 + 0.15 * sin(time * twinkleRate + h1 * 62.8 + h2 * 31.4);
-                    float luminance   = (1.0 - mag * 0.85) * bright * twinkle;
-                    col += starCol * (glow * 0.6 + core * 1.4) * luminance * exist;
-                }
-            }
+            mesh.indices.add(mesh.indices.size());
+          }
         }
-
-        // Milky Way
-        float ga  = 0.52;
-        float cga = cos(ga), sga = sin(ga);
-        vec3  gr  = vec3(rd.x, cga*rd.y - sga*rd.z, sga*rd.y + cga*rd.z);
-        float latB    = abs(gr.y);
-        float bandFall= exp(-latB * latB / 0.025);
-        float mwNoise = fbm(gr * vec3(3.0, 12.0, 3.0), 5) * 0.6
-            + fbm(gr * vec3(6.0, 20.0, 6.0) + 7.3, 4) * 0.4;
-        mwNoise = clamp(mwNoise, 0., 1.);
-        vec3 mwCore = mix(vec3(0.55, 0.50, 0.75), vec3(0.75, 0.70, 0.55), mwNoise);
-        col += mwCore * bandFall * mwNoise * 0.22;
-        float hazeFbm = fbm(rd * 1.4 + 5.7, 4);
-        col += vec3(0.010, 0.008, 0.018) * hazeFbm;
-
-        return col;
+      }
+    } catch (IOException e) {
+      throw new RuntimeException("Could not load OBJ: " + path, e);
     }
-    // ──────────────────────────────────────────────────────────────────────────
+    return mesh;
+  }
 
-    const vec3  SUN_C     = vec3(0.);
-    const float SUN_R     = 2.4;
+  private int createMesh(MeshData mesh) {
+    int vao = glGenVertexArrays();
+    int vbo = glGenBuffers();
+    int ebo = glGenBuffers();
+    glBindVertexArray(vao);
 
-    // Mustafar
-    const float MUS_ORBIT = 9.0;
-    const float MUS_R     = 1.55;
+    int    n          = mesh.vertices.size() / 3;
+    float[] interleaved = new float[n * 5];
+    for (int i = 0; i < n; i++) {
+      interleaved[i * 5]     = mesh.vertices.get(i * 3);
+      interleaved[i * 5 + 1] = mesh.vertices.get(i * 3 + 1);
+      interleaved[i * 5 + 2] = mesh.vertices.get(i * 3 + 2);
+      interleaved[i * 5 + 3] = mesh.texCoords.get(i * 2);
+      interleaved[i * 5 + 4] = mesh.texCoords.get(i * 2 + 1);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, interleaved, GL_STATIC_DRAW);
 
-    // Kashyyyk — further out, slightly larger
-    const float KAS_ORBIT = 16.5;
-    const float KAS_R     = 1.75;
+    int[] idx = mesh.indices.stream().mapToInt(i -> i).toArray();
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx, GL_STATIC_DRAW);
 
-    vec3 musPlanetCenter(){
-        float a = uTime * 0.18;
-        return vec3(cos(a)*MUS_ORBIT, sin(a)*0.4, sin(a)*MUS_ORBIT);
+    glVertexAttribPointer(0, 3, GL_FLOAT, false, 5 * Float.BYTES, 0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, false, 5 * Float.BYTES, 3 * Float.BYTES);
+    glEnableVertexAttribArray(1);
+
+    glBindVertexArray(0);
+    return vao;
+  }
+
+  // -------------------------------------------------------------------------
+  // Texture loader
+  // -------------------------------------------------------------------------
+
+  private int loadTexture(String path) {
+    int texID = glGenTextures();
+    glBindTexture(GL_TEXTURE_2D, texID);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,       GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,       GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,   GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,   GL_LINEAR);
+    try (MemoryStack st = stackPush()) {
+      IntBuffer w = st.mallocInt(1), h = st.mallocInt(1), ch = st.mallocInt(1);
+      ByteBuffer data = stbi_load(path, w, h, ch, 4);
+      if (data == null)
+        throw new RuntimeException("Failed to load texture: " + path
+            + "\n" + stbi_failure_reason());
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w.get(0), h.get(0),
+          0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+      glGenerateMipmap(GL_TEXTURE_2D);
+      stbi_image_free(data);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    System.out.println("Loaded texture: " + path);
+    return texID;
+  }
+
+  // -------------------------------------------------------------------------
+  // Shader compiler helper
+  // -------------------------------------------------------------------------
+
+  private int compileProgram(String vertSrc, String fragSrc, String name) {
+    int vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vs, vertSrc); glCompileShader(vs);
+    if (glGetShaderi(vs, GL_COMPILE_STATUS) == GL_FALSE)
+      throw new RuntimeException(name + " vert: " + glGetShaderInfoLog(vs));
+
+    int fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fs, fragSrc); glCompileShader(fs);
+    if (glGetShaderi(fs, GL_COMPILE_STATUS) == GL_FALSE)
+      throw new RuntimeException(name + " frag: " + glGetShaderInfoLog(fs));
+
+    int prog = glCreateProgram();
+    glAttachShader(prog, vs); glAttachShader(prog, fs);
+    glLinkProgram(prog);
+    if (glGetProgrami(prog, GL_LINK_STATUS) == GL_FALSE)
+      throw new RuntimeException(name + " link: " + glGetProgramInfoLog(prog));
+
+    glDeleteShader(vs); glDeleteShader(fs);
+    return prog;
+  }
+
+  // -------------------------------------------------------------------------
+  // Platform loading
+  // -------------------------------------------------------------------------
+
+  private void loadPlatform() {
+    System.out.println("Loading platform.obj...");
+    MeshData platformMesh = loadOBJ("platform.obj");
+    platformVAO = createMesh(platformMesh);
+    platformIndexCount = platformMesh.indices.size();
+    texPlatform = loadTexture("platform.png");
+    System.out.println("Platform loaded with " + platformIndexCount + " triangles");
+  }
+
+  private void renderPlatform(float[] view, float[] proj, float time) {
+    glUseProgram(platformProg);
+
+    int pModel = glGetUniformLocation(platformProg, "uModel");
+    int pView = glGetUniformLocation(platformProg, "uView");
+    int pProj = glGetUniformLocation(platformProg, "uProjection");
+    int pTex = glGetUniformLocation(platformProg, "uTexture");
+    int pSunPos = glGetUniformLocation(platformProg, "uSunPos");
+    int pViewPos = glGetUniformLocation(platformProg, "uViewPos");
+    int pTime = glGetUniformLocation(platformProg, "uTime");
+
+    glUniformMatrix4fv(pView, false, view);
+    glUniformMatrix4fv(pProj, false, proj);
+    glUniform3f(pSunPos, 0.0f, 0.0f, 0.0f);
+    glUniform3f(pViewPos, camX, camY, camZ);
+    glUniform1f(pTime, time);
+
+    float[] model = createModelMatrix(0, platformY, 0, 1.0f);
+    glUniformMatrix4fv(pModel, false, model);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texPlatform);
+    glUniform1i(pTex, 0);
+
+    glBindVertexArray(platformVAO);
+    glDrawElements(GL_TRIANGLES, platformIndexCount, GL_UNSIGNED_INT, 0);
+  }
+
+  // -------------------------------------------------------------------------
+  // Init
+  // -------------------------------------------------------------------------
+
+  private void init() {
+    GLFWErrorCallback.createPrint(System.err).set();
+    if (!glfwInit()) throw new IllegalStateException("GLFW failed");
+
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    glfwWindowHint(GLFW_OPENGL_PROFILE,        GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+    glfwWindowHint(GLFW_RESIZABLE,             GLFW_FALSE);
+
+    window = glfwCreateWindow(WIDTH, HEIGHT,
+        "Star Wars System - Mustafar & Kashyyyk", NULL, NULL);
+    if (window == NULL) throw new RuntimeException("Window failed");
+
+    try (MemoryStack st = stackPush()) {
+      IntBuffer pw = st.mallocInt(1), ph = st.mallocInt(1);
+      glfwGetWindowSize(window, pw, ph);
+      GLFWVidMode vm = glfwGetVideoMode(glfwGetPrimaryMonitor());
+      glfwSetWindowPos(window,
+          (vm.width()  - pw.get(0)) / 2,
+          (vm.height() - ph.get(0)) / 2);
     }
 
-    vec3 kasPlanetCenter(){
-        // Kashyyyk orbits slower (Kepler-ish), slight inclination, offset phase
-        float a = uTime * 0.10 + 2.1;
-        return vec3(cos(a)*KAS_ORBIT, sin(a)*0.25, sin(a)*KAS_ORBIT);
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1);
+    glfwShowWindow(window);
+    GL.createCapabilities();
+
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);   glCullFace(GL_BACK);
+    glEnable(GL_LINE_SMOOTH); glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+    glEnable(GL_BLEND);       glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    initAudio();
+    
+    texMustafar = loadTexture("mustafar.png");
+    texKashyyyk = loadTexture("kashyyyk.png");
+
+    System.out.println("Loading mustafar.obj...");
+    MeshData mustafarMesh = loadOBJ("mustafar.obj");
+    mustafarVAO        = createMesh(mustafarMesh);
+    mustafarIndexCount = mustafarMesh.indices.size();
+
+    System.out.println("Loading kashyyyk.obj...");
+    MeshData kashyyykMesh = loadOBJ("kashyyyk.obj");
+    kashyyykVAO        = createMesh(kashyyykMesh);
+    kashyyykIndexCount = kashyyykMesh.indices.size();
+
+    loadPlatform();
+    generateSun();
+    generateGrid();
+
+    planetProg = compileProgram(VERT_PLANET, FRAG_PLANET, "Planet");
+    platformProg = compileProgram(VERT_PLATFORM, FRAG_PLATFORM, "Platform");
+    sunProg    = compileProgram(VERT_SUN,    FRAG_SUN,    "Sun");
+    gridProg   = compileProgram(VERT_GRID,   FRAG_GRID,   "Grid");
+
+    startTime = glfwGetTime();
+
+    // --- Input callbacks ---
+    glfwSetKeyCallback(window, (win, key, sc, action, mods) -> {
+      boolean dn = action != GLFW_RELEASE;
+      if (key == GLFW_KEY_W) wDown = dn;
+      if (key == GLFW_KEY_S) sDown = dn;
+      if (key == GLFW_KEY_A) aDown = dn;
+      if (key == GLFW_KEY_D) dDown = dn;
+      if (key == GLFW_KEY_SPACE)      spDown = dn;
+      if (key == GLFW_KEY_LEFT_SHIFT  || key == GLFW_KEY_RIGHT_SHIFT) shDown = dn;
+      if (key == GLFW_KEY_ESCAPE && action == GLFW_RELEASE) {
+        if (locked) { glfwSetInputMode(win, GLFW_CURSOR, GLFW_CURSOR_NORMAL); locked = false; }
+        else glfwSetWindowShouldClose(win, true);
+      }
+    });
+
+    glfwSetMouseButtonCallback(window, (win, button, action, mods) -> {
+      if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS && !locked) {
+        glfwSetInputMode(win, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+        locked = true; firstMouse = true;
+      }
+    });
+
+    glfwSetCursorPosCallback(window, (win, mx, my) -> {
+      if (!locked) return;
+      if (firstMouse) { lastMouseX = mx; lastMouseY = my; firstMouse = false; return; }
+      double dx = mx - lastMouseX, dy = my - lastMouseY;
+      lastMouseX = mx; lastMouseY = my;
+      float sens = 0.0015f;
+      yaw   += (float)(dx * sens);
+      pitch -= (float)(dy * sens);
+      pitch  = Math.max(-(float)Math.PI / 2 + 0.01f,
+          Math.min( (float)Math.PI / 2 - 0.01f, pitch));
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Main loop
+  // -------------------------------------------------------------------------
+
+  private void loop() {
+    glClearColor(0.0f, 0.0f, 0.02f, 1.0f);
+
+    // --- Uniform locations ---
+    int pModel   = glGetUniformLocation(planetProg, "uModel");
+    int pView    = glGetUniformLocation(planetProg, "uView");
+    int pProj    = glGetUniformLocation(planetProg, "uProjection");
+    int pTex     = glGetUniformLocation(planetProg, "uTexture");
+    int pSunPos  = glGetUniformLocation(planetProg, "uSunPos");
+    int pCenter  = glGetUniformLocation(planetProg, "uPlanetCenter");
+    int pViewPos = glGetUniformLocation(planetProg, "uViewPos");
+    int pTime    = glGetUniformLocation(planetProg, "uTime");
+
+    int sModel = glGetUniformLocation(sunProg, "uModel");
+    int sView  = glGetUniformLocation(sunProg, "uView");
+    int sProj  = glGetUniformLocation(sunProg, "uProjection");
+    int sTime  = glGetUniformLocation(sunProg, "uTime");
+
+    int gView   = glGetUniformLocation(gridProg, "uView");
+    int gProj   = glGetUniformLocation(gridProg, "uProjection");
+    int gCamPos = glGetUniformLocation(gridProg, "uCamPos");
+
+    double prev = glfwGetTime();
+
+    while (!glfwWindowShouldClose(window)) {
+      double now = glfwGetTime();
+      float  dt  = (float)(now - prev); prev = now;
+      float  t   = (float)(now - startTime);
+
+      // --- Update orbits & axial rotations ---
+      orbitAngleMus += dt * 0.5;
+      orbitAngleKas += dt * 0.3;
+      musRotation   += dt * 0.8;
+      kasRotation   += dt * 0.5;
+
+      musX = (float)(Math.cos(orbitAngleMus) * 9.0);
+      musZ = (float)(Math.sin(orbitAngleMus) * 9.0);
+      kasX = (float)(Math.cos(orbitAngleKas) * 16.5);
+      kasZ = (float)(Math.sin(orbitAngleKas) * 16.5);
+
+      // --- Camera movement ---
+      float speed = 10.0f * dt;
+      float fwdX  = (float) Math.sin(yaw),  fwdZ = -(float) Math.cos(yaw);
+      float rtX   = (float) Math.cos(yaw),  rtZ  =  (float) Math.sin(yaw);
+      if (wDown)  { camX += fwdX * speed; camZ += fwdZ * speed; }
+      if (sDown)  { camX -= fwdX * speed; camZ -= fwdZ * speed; }
+      if (aDown)  { camX -= rtX  * speed; camZ -= rtZ  * speed; }
+      if (dDown)  { camX += rtX  * speed; camZ += rtZ  * speed; }
+      if (spDown)  camY += speed;
+      if (shDown)  camY -= speed;
+
+      glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+      float[] view = createViewMatrix();
+      float[] proj = createProjectionMatrix();
+
+      // --- Grid ---
+      glUseProgram(gridProg);
+      glUniformMatrix4fv(gView, false, view);
+      glUniformMatrix4fv(gProj, false, proj);
+      glUniform3f(gCamPos, camX, camY, camZ);
+      glBindVertexArray(gridVAO);
+      glDrawElements(GL_LINES, gridIndexCount, GL_UNSIGNED_INT, 0);
+
+      // --- Sun ---
+      glUseProgram(sunProg);
+      glUniformMatrix4fv(sView, false, view);
+      glUniformMatrix4fv(sProj, false, proj);
+      glUniform1f(sTime, t);
+      glUniformMatrix4fv(sModel, false, createModelMatrix(0, 0, 0, 2.0f));
+      glBindVertexArray(sunVAO);
+      glDrawElements(GL_TRIANGLES, sunIndexCount, GL_UNSIGNED_INT, 0);
+
+      // --- Platform ---
+      renderPlatform(view, proj, t);
+
+      // --- Planets (shared uniforms) ---
+      glUseProgram(planetProg);
+      glUniformMatrix4fv(pView,    false, view);
+      glUniformMatrix4fv(pProj,    false, proj);
+      glUniform3f(pSunPos,  0.0f, 0.0f, 0.0f);
+      glUniform3f(pViewPos, camX, camY, camZ);
+      glUniform1f(pTime,    t);
+
+      // --- Mustafar ---
+      glUniform3f(pCenter, musX, 0.0f, musZ);
+      glUniformMatrix4fv(pModel, false, buildPlanetModel(musX, musZ, musRotation, 1.55f));
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, texMustafar);
+      glUniform1i(pTex, 0);
+      glBindVertexArray(mustafarVAO);
+      glDrawElements(GL_TRIANGLES, mustafarIndexCount, GL_UNSIGNED_INT, 0);
+
+      // --- Kashyyyk ---
+      glUniform3f(pCenter, kasX, 0.0f, kasZ);
+      glUniformMatrix4fv(pModel, false, buildPlanetModel(kasX, kasZ, kasRotation, 1.75f));
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, texKashyyyk);
+      glUniform1i(pTex, 0);
+      glBindVertexArray(kashyyykVAO);
+      glDrawElements(GL_TRIANGLES, kashyyykIndexCount, GL_UNSIGNED_INT, 0);
+
+      glBindVertexArray(0);
+      glfwSwapBuffers(window);
+      glfwPollEvents();
     }
+  }
 
-    // ── Signed-distance functions ──────────────────────────────────────────────
+  // -------------------------------------------------------------------------
+  // Matrix helpers
+  // -------------------------------------------------------------------------
 
-    float sdMustafar(vec3 p, vec3 c){
-        vec3 n   = normalize(p - c);
-        float spin = uTime * 0.25, cs = cos(spin), sn = sin(spin);
-        vec3 rot = vec3(cs*n.x + sn*n.z, n.y, -sn*n.x + cs*n.z);
-        float disp = fbm(rot*3.0, 6)*0.18 + fbm(rot*7.0, 3)*0.05;
-        return length(p - c) - MUS_R - disp;
-    }
+  private float[] buildPlanetModel(float x, float z, float rotation, float scale) {
+    float c = (float) Math.cos(rotation) * scale;
+    float s = (float) Math.sin(rotation) * scale;
 
-    float sdKashyyyk(vec3 p, vec3 c){
-        vec3 n   = normalize(p - c);
-        float spin = uTime * 0.20, cs = cos(spin), sn = sin(spin);
-        vec3 rot = vec3(cs*n.x + sn*n.z, n.y, -sn*n.x + cs*n.z);
-        // Dense jungle canopy gives soft, organic displacement
-        float canopy = fbm(rot*2.5,  7)*0.20 + fbm(rot*6.0,  4)*0.07;
-        float ocean  = fbm(rot*12.0, 3)*0.01;   // subtle ocean wavelet
-        return length(p - c) - KAS_R - canopy - ocean;
-    }
+    float[] m = new float[16];
+    m[0]  =  c;
+    m[1]  =  0;
+    m[2]  = -s;
+    m[3]  =  0;
+    m[4]  =  0;
+    m[5]  =  scale;
+    m[6]  =  0;
+    m[7]  =  0;
+    m[8]  =  s;
+    m[9]  =  0;
+    m[10] =  c;
+    m[11] =  0;
+    m[12] =  x;
+    m[13] =  0;
+    m[14] =  z;
+    m[15] =  1;
+    return m;
+  }
 
-    float sdSun(vec3 p){
-        vec3 n=normalize(p-SUN_C);
-        float disp=fbm(n*4.+uTime*.08,4)*0.12+fbm(n*9.+uTime*.05,3)*0.04;
-        return length(p-SUN_C)-SUN_R-disp;
-    }
+  private float[] createViewMatrix() {
+    float[] forward = {
+      (float)(Math.sin(yaw) * Math.cos(pitch)),
+      (float)(Math.sin(pitch)),
+      (float)(-Math.cos(yaw) * Math.cos(pitch))
+    };
 
-    // id: 1=Mustafar, 2=Sun, 3=Kashyyyk
-    vec2 sceneAll(vec3 p){
-        vec3 mc = musPlanetCenter();
-        vec3 kc = kasPlanetCenter();
-        float dm = sdMustafar(p, mc);
-        float ds = sdSun(p);
-        float dk = sdKashyyyk(p, kc);
+    float[] right = {
+      forward[1] * 0 - forward[2] * 1,
+      forward[2] * 0 - forward[0] * 0,
+      forward[0] * 1 - forward[1] * 0
+    };
+    float rLen = (float) Math.sqrt(right[0]*right[0] + right[1]*right[1] + right[2]*right[2]);
+    right[0] /= rLen; right[1] /= rLen; right[2] /= rLen;
 
-        float best = dm; float id = 1.;
-        if (ds < best) { best = ds; id = 2.; }
-        if (dk < best) { best = dk; id = 3.; }
-        return vec2(best, id);
-    }
+    float[] up = {
+      right[1]*forward[2] - right[2]*forward[1],
+      right[2]*forward[0] - right[0]*forward[2],
+      right[0]*forward[1] - right[1]*forward[0]
+    };
 
-    // Shadow-caster: only solid planets cast shadows on each other
-    float scenePlanetsOnly(vec3 p){
-        float dm = sdMustafar(p, musPlanetCenter());
-        float dk = sdKashyyyk(p, kasPlanetCenter());
-        return min(dm, dk);
-    }
+    float[] v = new float[16];
+    v[0] =  right[0];    v[4] =  right[1];    v[8]  =  right[2];
+    v[1] =  up[0];       v[5] =  up[1];       v[9]  =  up[2];
+    v[2] = -forward[0];  v[6] = -forward[1];  v[10] = -forward[2];
+    v[3] = 0;            v[7] = 0;            v[11] = 0;
+    v[12] = -(right[0]*camX   + right[1]*camY   + right[2]*camZ);
+    v[13] = -(up[0]*camX      + up[1]*camY      + up[2]*camZ);
+    v[14] =  (forward[0]*camX + forward[1]*camY + forward[2]*camZ);
+    v[15] = 1;
+    return v;
+  }
 
-    vec3 calcNormal(vec3 p){
-        const float e=0.002;
-        const vec2 k=vec2(1.,-1.);
-        return normalize(
-                k.xyy*sceneAll(p+k.xyy*e).x +
-                k.yyx*sceneAll(p+k.yyx*e).x +
-                k.yxy*sceneAll(p+k.yxy*e).x +
-                k.xxx*sceneAll(p+k.xxx*e).x
-                );
-    }
+  private float[] createProjectionMatrix() {
+    float aspect      = (float) WIDTH / HEIGHT;
+    float near        = 0.1f, far = 200.0f;
+    float tanHalfFOV  = (float) Math.tan(FOV / 2.0);
+    float[] p = new float[16];
+    p[0]  = 1.0f / (aspect * tanHalfFOV);
+    p[5]  = 1.0f / tanHalfFOV;
+    p[10] = -(far + near) / (far - near);
+    p[11] = -1;
+    p[14] = -(2.0f * far * near) / (far - near);
+    return p;
+  }
 
-    vec2 raymarch(vec3 ro, vec3 rd){
-        float t=0.1;
-        for(int i=0;i<148;i++){
-            vec2 res=sceneAll(ro+rd*t);
-            if(res.x<0.002) return vec2(t,res.y);
-            t+=res.x;
-            if(t>200.) break;
+  private float[] createModelMatrix(float x, float y, float z, float scale) {
+    float[] m = new float[16];
+    m[0] = scale; m[5] = scale; m[10] = scale; m[15] = 1;
+    m[12] = x; m[13] = y; m[14] = z;
+    return m;
+  }
+
+// -------------------------------------------------------------------------
+// Audio System
+// -------------------------------------------------------------------------
+
+private void initAudio() {
+    try {
+        // Try to load as WAV first, then MP3
+        File audioFile = new File("space_audio.wav");
+        if (!audioFile.exists()) {
+            audioFile = new File("space_audio.mp3");
         }
-        return vec2(-1.,0.);
-    }
-
-    float softShadow(vec3 ro, vec3 rd, float mint, float maxt, float k){
-        float res=1., t=mint, ph=1e10;
-        for(int i=0;i<64;i++){
-            float h=scenePlanetsOnly(ro+rd*t);
-            if(h<0.001) return 0.;
-            float y=h*h/(2.*ph);
-            float d=sqrt(max(0.,h*h-y*y));
-            res=min(res, k*d/max(0.001,t-y));
-            ph=h; t+=h;
-            if(t>maxt) break;
+        
+        if (!audioFile.exists()) {
+            System.err.println("Audio file not found. Please add space_audio.wav or space_audio.mp3");
+            return;
         }
-        return clamp(res,0.,1.);
-    }
-
-    float ambientOcc(vec3 p, vec3 n){
-        float occ=0., sca=1.;
-        for(int i=0;i<5;i++){
-            float h=0.02+0.12*float(i)/4.;
-            float d=scenePlanetsOnly(p+n*h);
-            occ+=(h-d)*sca;
-            sca*=0.85;
+        
+        // Get audio input stream
+        AudioInputStream audioStream = AudioSystem.getAudioInputStream(audioFile);
+        
+        // Get the format and convert if necessary
+        AudioFormat format = audioStream.getFormat();
+        
+        // If not already PCM, convert to PCM
+        if (format.getEncoding() != AudioFormat.Encoding.PCM_SIGNED) {
+            AudioFormat pcmFormat = new AudioFormat(
+                AudioFormat.Encoding.PCM_SIGNED,
+                format.getSampleRate(),
+                16,
+                format.getChannels(),
+                format.getChannels() * 2,
+                format.getSampleRate(),
+                false
+            );
+            audioStream = AudioSystem.getAudioInputStream(pcmFormat, audioStream);
         }
-        return clamp(1.-2.*occ,0.,1.);
+        
+        // Create and open clip
+        backgroundMusic = AudioSystem.getClip();
+        backgroundMusic.open(audioStream);
+        
+        // Loop continuously
+        backgroundMusic.loop(Clip.LOOP_CONTINUOUSLY);
+        
+        // Set volume (0.0 to 1.0)
+        FloatControl volume = (FloatControl) backgroundMusic.getControl(FloatControl.Type.MASTER_GAIN);
+        volume.setValue(-10.0f); // Reduce volume slightly
+        
+        // Start playing
+        backgroundMusic.start();
+        
+        System.out.println("Playing background music: " + audioFile.getName());
+        
+    } catch (Exception e) {
+        System.err.println("Could not play audio: " + e.getMessage());
+        System.err.println("Make sure you have space_audio.wav in the current directory");
     }
+}
 
-    // ── Mustafar surface ───────────────────────────────────────────────────────
-    vec3 musColor(vec3 n){
-        float spin=uTime*0.18, cs=cos(spin), sn=sin(spin);
-        vec3 rot=vec3(cs*n.x+sn*n.z, n.y, -sn*n.x+cs*n.z);
-
-        float plate  = fbm(rot*1.8,          6);
-        float crack  = fbm(rot*6.5  + 2.3,   5);
-        float micro  = fbm(rot*18.0 + 7.1,   3);
-
-        float crackMask = smoothstep(0.52, 0.46, crack + plate*0.3);
-        float plateMask = smoothstep(0.40, 0.60, plate);
-
-        float rockVar = micro * 0.5 + plate * 0.5;
-        vec3 rockDark  = vec3(0.022, 0.018, 0.020);
-        vec3 rockMid   = vec3(0.055, 0.042, 0.038);
-        vec3 rockHot   = vec3(0.110, 0.060, 0.040);
-        vec3 rockCol   = mix(rockDark, rockMid,  smoothstep(0.3, 0.7, rockVar));
-        rockCol        = mix(rockCol,  rockHot,  crackMask * 0.55);
-        float sheen    = smoothstep(0.60, 0.80, micro) * (1.0 - crackMask);
-        rockCol       += vec3(0.018, 0.012, 0.035) * sheen;
-
-        float lavaFlow = fbm(rot*4.2 + uTime*0.12, 4);
-        float lavaTemp = clamp(lavaFlow * 1.3 - crackMask * 0.2, 0., 1.);
-
-        vec3 lavaWhite  = vec3(1.00, 0.96, 0.78);
-        vec3 lavaOrange = vec3(1.00, 0.52, 0.04);
-        vec3 lavaRed    = vec3(0.72, 0.08, 0.01);
-        vec3 lavaCrust  = vec3(0.28, 0.03, 0.01);
-
-        vec3 lavaCol = mix(lavaCrust,  lavaRed,    smoothstep(0.10, 0.35, lavaTemp));
-        lavaCol      = mix(lavaCol,    lavaOrange, smoothstep(0.35, 0.65, lavaTemp));
-        lavaCol      = mix(lavaCol,    lavaWhite,  smoothstep(0.72, 0.95, lavaTemp));
-
-        vec3 surface = mix(rockCol, lavaCol, crackMask);
-        float emGlow = crackMask * (0.5 + 0.5 * lavaTemp);
-        vec3  emCol  = lavaCol * emGlow * 3.2;
-
-        return surface + emCol;
+private void cleanupAudio() {
+    if (backgroundMusic != null) {
+        backgroundMusic.stop();
+        backgroundMusic.close();
     }
+}
+  // -------------------------------------------------------------------------
+  // Cleanup
+  // -------------------------------------------------------------------------
 
-    // ── Kashyyyk surface ───────────────────────────────────────────────────────
-    vec3 kasColor(vec3 n){
-        float spin = uTime * 0.20, cs = cos(spin), sn = sin(spin);
-        vec3 rot = vec3(cs*n.x + sn*n.z, n.y, -sn*n.x + cs*n.z);
+  private void cleanup() {
+    glDeleteTextures(texMustafar);
+    glDeleteTextures(texKashyyyk);
+    glDeleteTextures(texPlatform);
+    glDeleteProgram(planetProg);
+    glDeleteProgram(platformProg);
+    glDeleteProgram(sunProg);
+    glDeleteProgram(gridProg);
+    glDeleteVertexArrays(mustafarVAO);
+    glDeleteVertexArrays(kashyyykVAO);
+    glDeleteVertexArrays(platformVAO);
+    glDeleteVertexArrays(sunVAO);
+    glDeleteVertexArrays(gridVAO);
+    glfwFreeCallbacks(window);
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    glfwSetErrorCallback(null).free();
+    cleanupAudio();
+  }
 
-        // Large-scale continental structure
-        float continent = fbm(rot * 1.4,          6);
-        // Mid-scale jungle canopy texture
-        float canopy    = fbm(rot * 4.5 + 3.1,    6);
-        // Fine forest-floor detail
-        float detail    = fbm(rot * 12.0 + 7.9,   4);
-        // Ocean / inland-sea mask (low continent = ocean basin)
-        float oceanMask = smoothstep(0.38, 0.50, continent);   // 0=ocean, 1=land
-                                                               // Polar icecap: fade to white near poles (|n.y| close to 1)
-        float polar     = smoothstep(0.72, 0.92, abs(rot.y));
-
-        // ── Land colours ─────────────────────────────────────────────────────────
-        // Kashyyyk is DENSE jungle — wroshyr trees 500m tall, layered canopy.
-        // Palette: near-black shadow green → vivid mid green → yellow-green tips
-        vec3 jungleDark  = vec3(0.018, 0.055, 0.020);   // deep shadow under canopy
-        vec3 jungleMid   = vec3(0.055, 0.160, 0.048);   // main canopy
-        vec3 jungleBright= vec3(0.120, 0.290, 0.060);   // sunlit treetop highlights
-        vec3 jungleYellow= vec3(0.200, 0.350, 0.040);   // new growth / cleared areas
-
-        float canopyBlend = smoothstep(0.30, 0.70, canopy + detail * 0.25);
-        vec3 jungleCol = mix(jungleDark, jungleMid,   smoothstep(0.20, 0.55, canopyBlend));
-        jungleCol      = mix(jungleCol,  jungleBright, smoothstep(0.55, 0.80, canopyBlend));
-        jungleCol      = mix(jungleCol,  jungleYellow, smoothstep(0.82, 0.96, canopyBlend) * 0.4);
-
-        // Rocky highland / mountain ridge — darker brownish-green
-        float mountain  = smoothstep(0.64, 0.82, continent + canopy * 0.2);
-        vec3  ridgeCol  = mix(jungleDark, vec3(0.08, 0.07, 0.05), mountain);
-        jungleCol       = mix(jungleCol, ridgeCol, mountain * 0.6);
-
-        // ── Ocean / Shadowsea ─────────────────────────────────────────────────────
-        // Deep teal-blue ocean (orbital views show vast inland seas)
-        float waveNoise  = fbm(rot * 9.0 + uTime * 0.04, 3);
-        vec3 oceanDeep   = vec3(0.012, 0.060, 0.120);   // abyssal dark blue
-        vec3 oceanShallow= vec3(0.045, 0.170, 0.240);   // shallow shelf cyan
-        vec3 oceanCol    = mix(oceanDeep, oceanShallow, smoothstep(0.35, 0.65, waveNoise));
-        // Specular glint on ocean surface
-        float oceanSpec  = pow(waveNoise, 3.0) * 0.6;
-        oceanCol        += vec3(0.3, 0.6, 0.8) * oceanSpec * (1.0 - oceanMask);
-
-        // ── Polar icecaps ─────────────────────────────────────────────────────────
-        vec3 iceCol = vec3(0.80, 0.90, 0.95);
-        float iceNoise = fbm(rot * 8.0 + 11.3, 3) * 0.15;
-        vec3 polarCol  = mix(jungleCol, iceCol, polar + iceNoise * polar);
-
-        // ── Compose land → ocean → polar ─────────────────────────────────────────
-        vec3 surface = mix(oceanCol, polarCol, oceanMask);
-
-        // ── Atmospheric cloud wisps ────────────────────────────────────────────────
-        // Kashyyyk has a thick humid atmosphere — partial cloud cover visible from orbit
-        float cloud = fbm(rot * 3.5 + uTime * 0.025, 5);
-        float cloudMask = smoothstep(0.56, 0.68, cloud);
-        vec3  cloudCol  = vec3(0.70, 0.78, 0.85);   // slightly blue-tinted clouds
-        surface = mix(surface, cloudCol, cloudMask * 0.50);
-
-        return surface;
-    }
-
-    // ── Sun surface ───────────────────────────────────────────────────────────
-    vec3 sunSurfColor(vec3 n){
-        float t=uTime;
-        vec3 p=n*4.+vec3(t*.10,t*.07,t*.13);
-        float g=fbm(p,5), sp=fbm(p*2.5+9.3,4), fl=fbm(n*6.+t*.05,3);
-        float bl=smoothstep(.3,.7,g);
-        vec3 col=mix(vec3(.7,.3,.05),mix(vec3(1.,.6,.1),vec3(1.,.95,.7),bl),bl);
-        col+=vec3(1.,.8,.3)*pow(max(0.,fl-.4),2.)*2.;
-        col=mix(col,vec3(.7,.3,.05)*.6,smoothstep(.65,.5,sp)*.5);
-        return col*vec3(2.5,1.6,0.4)*1.4;
-    }
-
-    // ── Nebulae ────────────────────────────────────────────────────────────────
-    vec3 nebula(vec3 rd) {
-        vec3 col = vec3(0.);
-
-        // Lobe A: large H-alpha emission cloud, red/crimson
-        {
-            vec3  axis  = normalize(vec3(-0.6, 0.5, -0.8));
-            float align = dot(rd, axis);
-            float fall  = exp(-max(0., 1.0 - align) * 3.5);
-            vec3  p     = rd * 2.3 + vec3(1.7, 0.4, 2.1);
-            float n1    = fbm(p,         6);
-            float n2    = fbm(p * 2.1 + 3.9, 4);
-            float shape = smoothstep(0.38, 0.72, n1 + n2 * 0.35) * fall;
-            float dust  = smoothstep(0.55, 0.45, fbm(p * 1.7 + 9.1, 4));
-            vec3  hue   = mix(vec3(0.55, 0.02, 0.04), vec3(0.90, 0.12, 0.08),
-                    smoothstep(0.4, 0.7, n1));
-            hue += vec3(0.04, 0.12, 0.18) * smoothstep(0.6, 0.8, n2);
-            col += hue * shape * dust * 0.55;
-        }
-
-        // Lobe B: orange/amber shocked gas
-        {
-            vec3  axis  = normalize(vec3(0.7, -0.3, 0.6));
-            float align = dot(rd, axis);
-            float fall  = exp(-max(0., 1.0 - align) * 5.0);
-            vec3  p     = rd * 3.1 + vec3(5.2, 1.1, 3.8);
-            float n1    = fbm(p,         5);
-            float n2    = fbm(p * 2.4 + 7.3, 3);
-            float shape = smoothstep(0.42, 0.68, n1 + n2 * 0.3) * fall;
-            vec3  hue   = mix(vec3(0.45, 0.10, 0.01), vec3(0.95, 0.45, 0.05),
-                    smoothstep(0.35, 0.65, n1));
-            col += hue * shape * 0.40;
-        }
-
-        // Lobe C: faint purple/blue O-III outer shell
-        {
-            vec3  axis  = normalize(vec3(0.1, 0.8, 0.5));
-            float align = dot(rd, axis);
-            float fall  = exp(-max(0., 1.0 - align) * 2.0);
-            vec3  p     = rd * 1.6 + vec3(8.3, 4.1, 1.2);
-            float n1    = fbm(p,         5);
-            float shape = smoothstep(0.44, 0.65, n1) * fall;
-            vec3  hue   = mix(vec3(0.08, 0.05, 0.20), vec3(0.18, 0.10, 0.45),
-                    smoothstep(0.4, 0.7, n1));
-            col += hue * shape * 0.30;
-        }
-
-        return col;
-    }
-    // ──────────────────────────────────────────────────────────────────────────
-
-    // ── Mustafar lava atmosphere (orange-red) ─────────────────────────────────
-    vec3 lavaAtm(vec3 rd, vec3 pc, float pr, vec3 ld){
-        float ar=pr*1.22; vec3 oc=-pc;
-        float b=dot(oc,rd), c=dot(oc,oc)-ar*ar, disc=b*b-c;
-        if(disc<0.) return vec3(0.);
-        float sq=sqrt(disc), t2=-b+sq;
-        if(t2<0.) return vec3(0.);
-        float thickness=clamp((t2-max(-b-sq,0.))/(2.*ar),0.,1.);
-
-        float inner = pow(thickness, 0.6);
-        float outer = pow(thickness, 0.25);
-        float sunFacing = clamp(dot(normalize(pc), ld) * 0.5 + 0.5, 0., 1.);
-
-        vec3 innerCol = mix(vec3(0.60, 0.10, 0.01), vec3(1.00, 0.45, 0.05), inner);
-        vec3 outerCol = mix(vec3(0.20, 0.02, 0.00), vec3(0.55, 0.08, 0.01), outer);
-        vec3 atm = innerCol * inner * 0.55 + outerCol * outer * 0.30;
-
-        float lavaLit = (1.0 - sunFacing) * thickness * 0.35;
-        atm += vec3(0.80, 0.18, 0.02) * lavaLit;
-
-        return atm;
-    }
-
-    // ── Kashyyyk forest atmosphere (blue-teal) ────────────────────────────────
-    // Thick, humid atmosphere — Rayleigh scattering → vivid blue limb glow.
-    // Inner layer: teal-blue (oxygen + water vapour scatter).
-    // Outer limb: deep cobalt-indigo fringe (high-altitude haze).
-    // Night side: faint bio-luminescent blue-green from the wroshyr forest floor.
-    vec3 kasAtm(vec3 rd, vec3 pc, float pr, vec3 ld){
-        float ar = pr * 1.30;   // notably thicker than Mustafar (humid world)
-        vec3  oc = -pc;
-        float b  = dot(oc, rd), c = dot(oc, oc) - ar*ar, disc = b*b - c;
-        if (disc < 0.) return vec3(0.);
-        float sq = sqrt(disc), t2 = -b + sq;
-        if (t2 < 0.) return vec3(0.);
-        float thickness = clamp((t2 - max(-b-sq, 0.)) / (2.*ar), 0., 1.);
-
-        float inner = pow(thickness, 0.55);   // inner dense blue layer
-        float outer = pow(thickness, 0.20);   // diffuse outer limb
-
-        float sunFacing = clamp(dot(normalize(pc), ld) * 0.5 + 0.5, 0., 1.);
-
-        // Inner atmosphere: teal→cyan gradient
-        vec3 innerDark  = vec3(0.00, 0.08, 0.22);   // dark teal in shadow
-        vec3 innerBright= vec3(0.05, 0.35, 0.65);   // lit teal-blue
-        vec3 innerCol   = mix(innerDark, innerBright, sunFacing * inner);
-
-        // Outer limb haze: deep indigo-blue Rayleigh fringe
-        vec3 outerDark  = vec3(0.00, 0.04, 0.18);
-        vec3 outerBright= vec3(0.02, 0.15, 0.48);
-        vec3 outerCol   = mix(outerDark, outerBright, sunFacing);
-
-        vec3 atm = innerCol * inner * 0.60 + outerCol * outer * 0.35;
-
-        // Bioluminescent night-side glow: blue-green from below the canopy
-        float bioGlow = (1.0 - sunFacing) * thickness * 0.28;
-        atm += vec3(0.04, 0.28, 0.35) * bioGlow;
-
-        return atm;
-    }
-    // ──────────────────────────────────────────────────────────────────────────
-
-    void main(){
-        vec2 ndc = (gl_FragCoord.xy / uRes) * 2.0 - 1.0;
-        vec2 uv  = vec2(ndc.x * (uRes.x / uRes.y), ndc.y);
-
-        float cy=cos(uYaw),   sy=sin(uYaw);
-        float cp=cos(uPitch), sp=sin(uPitch);
-
-        vec3 right    = vec3(cy, 0., sy);
-        vec3 up       = vec3(0., 1., 0.);
-        vec3 viewFwd  = vec3(sy*cp, sp, -cy*cp);
-        vec3 viewRight= right;
-        vec3 viewUp   = cross(viewRight, viewFwd);
-
-        vec3 ro = uCamPos;
-        vec3 rd  = normalize(viewFwd + uv.x*uFOV*viewRight + uv.y*uFOV*viewUp);
-
-        vec3 musPc = musPlanetCenter();
-        vec3 kasPc = kasPlanetCenter();
-        vec3 ld    = normalize(SUN_C - musPc);   // light direction from sun
-
-        vec2 hit = raymarch(ro, rd);
-        vec3 color = vec3(0.);
-
-        if(hit.x > 0.){
-            vec3 pos = ro + rd * hit.x;
-            vec3 N   = calcNormal(pos);
-
-            if(hit.y < 1.5){
-                // ── Mustafar ─────────────────────────────────────────────────────────
-                vec3 alb = musColor(N);
-                float ao = ambientOcc(pos, N);
-                float diff = max(dot(N, ld), 0.);
-                float dist2sun = length(SUN_C - pos);
-                float shad = softShadow(pos + N*0.015, ld, 0.05, dist2sun, 14.);
-                vec3 sunL = vec3(2.2, 1.4, 0.35)*2.5*diff*shad;
-                vec3 amb  = vec3(0.18, 0.04, 0.005)*ao;
-                vec3 H    = normalize(ld - rd);
-                float spec = pow(max(dot(N, H), 0.), 120.)*0.6*shad;
-                float fres = pow(clamp(1.-dot(N,-rd), 0., 1.), 2.5)*0.8;
-                vec3 rim   = vec3(1., .30, .02)*fres*(0.4+0.6*(1.-shad));
-                color = alb*(sunL+amb) + spec*vec3(1.8,1.2,0.4) + rim;
-                vec3 atm = lavaAtm(rd, musPc, MUS_R, ld);
-                color = color*(1.-atm.r*0.35) + atm;
-
-            } else if(hit.y > 2.5){
-                // ── Kashyyyk ─────────────────────────────────────────────────────────
-                vec3 kasLd = normalize(SUN_C - kasPc);   // light toward Kashyyyk
-                vec3 alb = kasColor(N);
-                float ao = ambientOcc(pos, N);
-                float diff = max(dot(N, kasLd), 0.);
-                float dist2sun = length(SUN_C - pos);
-                float shad = softShadow(pos + N*0.015, kasLd, 0.05, dist2sun, 14.);
-                vec3 sunL = vec3(2.0, 1.6, 0.9) * 2.2 * diff * shad;
-                // Ambient: faint warm fill + bioluminescent blue-green underlight
-                vec3 amb  = vec3(0.05, 0.10, 0.08) * ao;
-                vec3 H    = normalize(kasLd - rd);
-                // Jungle/ocean has a softer, broader specular (wet leaves + ocean glint)
-                float spec = pow(max(dot(N, H), 0.), 55.) * 0.45 * shad;
-                // Rim: blue atmospheric edge backlit by sun — Kashyyyk's signature look
-                float fres = pow(clamp(1.-dot(N,-rd), 0., 1.), 2.2) * 0.9;
-                vec3 rim   = vec3(0.10, 0.50, 0.90) * fres * (0.5 + 0.5*(1.-shad));
-                color = alb*(sunL + amb) + spec*vec3(0.7, 0.9, 1.0) + rim;
-                vec3 atm = kasAtm(rd, kasPc, KAS_R, kasLd);
-                color = color*(1. - atm.b*0.25) + atm;
-
-            } else {
-                // ── Sun ───────────────────────────────────────────────────────────────
-                color = sunSurfColor(N);
-            }
-        } else {
-            // ── Background: nebulae + stars + both planet atmospheres ──────────────
-            color  = nebula(rd);
-            color += starfield(rd, uTime);
-            // Mustafar lava atmosphere halo visible from outside
-            vec3 musLd = normalize(SUN_C - musPc);
-            color += lavaAtm(rd, musPc - ro, MUS_R, musLd) * 0.6;
-            // Kashyyyk blue atmosphere limb glow visible from outside
-            vec3 kasLd = normalize(SUN_C - kasPc);
-            color += kasAtm(rd, kasPc - ro, KAS_R, kasLd) * 0.65;
-        }
-
-        color = color / (color + vec3(1.));
-        color = pow(color, vec3(1./2.2));
-        frag  = vec4(color, 1.);
-    }
-    """;
-
-    private void init() {
-        GLFWErrorCallback.createPrint(System.err).set();
-        if (!glfwInit()) throw new IllegalStateException("GLFW failed");
-
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
-        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-        glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-
-        window = glfwCreateWindow(WIDTH, HEIGHT, "Star Wars System — Mustafar & Kashyyyk", NULL, NULL);
-        if (window == NULL) throw new RuntimeException("Window failed");
-
-        try (MemoryStack st = stackPush()) {
-            IntBuffer pw = st.mallocInt(1), ph = st.mallocInt(1);
-            glfwGetWindowSize(window, pw, ph);
-            GLFWVidMode vm = glfwGetVideoMode(glfwGetPrimaryMonitor());
-            glfwSetWindowPos(window, (vm.width()-pw.get(0))/2, (vm.height()-ph.get(0))/2);
-        }
-
-        glfwMakeContextCurrent(window);
-        glfwSwapInterval(1);
-        glfwShowWindow(window);
-        GL.createCapabilities();
-
-        int vs = glCreateShader(GL_VERTEX_SHADER);
-        glShaderSource(vs, VERT); glCompileShader(vs);
-        if (glGetShaderi(vs, GL_COMPILE_STATUS)==GL_FALSE)
-            throw new RuntimeException("Vert: "+glGetShaderInfoLog(vs));
-
-        int fs = glCreateShader(GL_FRAGMENT_SHADER);
-        glShaderSource(fs, FRAG); glCompileShader(fs);
-        if (glGetShaderi(fs, GL_COMPILE_STATUS)==GL_FALSE)
-            throw new RuntimeException("Frag: "+glGetShaderInfoLog(fs));
-
-        prog = glCreateProgram();
-        glAttachShader(prog, vs); glAttachShader(prog, fs);
-        glLinkProgram(prog);
-        if (glGetProgrami(prog, GL_LINK_STATUS)==GL_FALSE)
-            throw new RuntimeException("Link: "+glGetProgramInfoLog(prog));
-        glDeleteShader(vs); glDeleteShader(fs);
-
-        float[] verts = {-1,-1, 1,-1, -1,1, 1,1};
-        vao = glGenVertexArrays(); vbo = glGenBuffers();
-        glBindVertexArray(vao);
-        glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        try (MemoryStack st = stackPush()) {
-            FloatBuffer fb = st.mallocFloat(8);
-            fb.put(verts).flip();
-            glBufferData(GL_ARRAY_BUFFER, fb, GL_STATIC_DRAW);
-        }
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 2, GL_FLOAT, false, 0, 0L);
-        glBindVertexArray(0);
-
-        startTime = glfwGetTime();
-
-        glfwSetKeyCallback(window, (win, key, sc, action, mods) -> {
-            boolean dn = action != GLFW_RELEASE;
-            if (key==GLFW_KEY_W) wDown=dn;
-            if (key==GLFW_KEY_S) sDown=dn;
-            if (key==GLFW_KEY_A) aDown=dn;
-            if (key==GLFW_KEY_D) dDown=dn;
-            if (key==GLFW_KEY_SPACE) spDown=dn;
-            if (key==GLFW_KEY_LEFT_SHIFT||key==GLFW_KEY_RIGHT_SHIFT) shDown=dn;
-            if (key==GLFW_KEY_ESCAPE && action==GLFW_RELEASE) {
-                if (locked) { glfwSetInputMode(win,GLFW_CURSOR,GLFW_CURSOR_NORMAL); locked=false; }
-                else glfwSetWindowShouldClose(win,true);
-            }
-        });
-
-        glfwSetMouseButtonCallback(window, (win, button, action, mods) -> {
-            if (button==GLFW_MOUSE_BUTTON_LEFT && action==GLFW_PRESS && !locked) {
-                glfwSetInputMode(win, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-                locked=true; firstMouse=true;
-            }
-        });
-
-        glfwSetCursorPosCallback(window, (win, mx, my) -> {
-            if (!locked) return;
-            if (firstMouse) { lastMouseX=mx; lastMouseY=my; firstMouse=false; return; }
-            double dx=mx-lastMouseX, dy=my-lastMouseY;
-            lastMouseX=mx; lastMouseY=my;
-            float sens=0.0015f;
-            yaw   += (float)(dx*sens);
-            pitch -= (float)(dy*sens);
-            pitch  = Math.max(-(float)Math.PI/2+0.01f, Math.min((float)Math.PI/2-0.01f, pitch));
-        });
-    }
-
-    private void loop() {
-        glClearColor(0,0,0,1);
-        int locRes    = glGetUniformLocation(prog,"uRes");
-        int locTime   = glGetUniformLocation(prog,"uTime");
-        int locCamPos = glGetUniformLocation(prog,"uCamPos");
-        int locYaw    = glGetUniformLocation(prog,"uYaw");
-        int locPitch  = glGetUniformLocation(prog,"uPitch");
-        int locFOV    = glGetUniformLocation(prog,"uFOV");
-
-        double prev = glfwGetTime();
-
-        while (!glfwWindowShouldClose(window)) {
-            double now = glfwGetTime();
-            float dt=(float)(now-prev); prev=now;
-
-            float speed=6.0f*dt;
-            float fwdX=(float)Math.sin(yaw),  fwdZ=-(float)Math.cos(yaw);
-            float rtX =(float)Math.cos(yaw),   rtZ = (float)Math.sin(yaw);
-
-            if (wDown)  { camX+=fwdX*speed; camZ+=fwdZ*speed; }
-            if (sDown)  { camX-=fwdX*speed; camZ-=fwdZ*speed; }
-            if (aDown)  { camX-=rtX*speed;  camZ-=rtZ*speed;  }
-            if (dDown)  { camX+=rtX*speed;  camZ+=rtZ*speed;  }
-            if (spDown) camY+=speed;
-            if (shDown) camY-=speed;
-
-            glClear(GL_COLOR_BUFFER_BIT);
-            glUseProgram(prog);
-            glUniform2f(locRes, WIDTH, HEIGHT);
-            glUniform1f(locTime, (float)(now-startTime));
-            glUniform3f(locCamPos, camX, camY, camZ);
-            glUniform1f(locYaw,   yaw);
-            glUniform1f(locPitch, pitch);
-            glUniform1f(locFOV,   FOV);
-            glBindVertexArray(vao);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-            glBindVertexArray(0);
-
-            glfwSwapBuffers(window);
-            glfwPollEvents();
-        }
-    }
-
-    private void cleanup() {
-        glDeleteProgram(prog);
-        glDeleteVertexArrays(vao);
-        glDeleteBuffers(vbo);
-        glfwFreeCallbacks(window);
-        glfwDestroyWindow(window);
-        glfwTerminate();
-        glfwSetErrorCallback(null).free();
-    }
-
-    public static void main(String[] args) { new Simulation().run(); }
+  public static void main(String[] args) { new Simulation().run(); }
 }
