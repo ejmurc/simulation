@@ -19,6 +19,7 @@ import static org.lwjgl.openal.ALC10.*;
 import org.lwjgl.stb.STBVorbis;
 import javax.sound.sampled.*;
 import java.io.File;
+import org.joml.Matrix4f;
 
 public class Simulation {
     private static final int WIDTH = 1280;
@@ -47,8 +48,8 @@ public class Simulation {
 
     private int gridVAO, gridIndexCount;
 
-    private float musX = 9.0f, musZ = 0.0f;
-    private float kasX = 16.5f, kasZ = 0.0f;
+    private float musX = 12.0f, musZ = 0.0f;
+    private float kasX = 22.0f, kasZ = 0.0f;
     private double orbitAngleMus = 0.0;
     private double orbitAngleKas = 2.1;
     private float musRotation = 0.0f;
@@ -63,6 +64,13 @@ public class Simulation {
     private boolean locked = false;
     private double lastMouseX, lastMouseY;
     private boolean firstMouse = true;
+
+    private int uModelPlanet, uViewPlanet, uProjPlanet, uTexPlanet, uSunPosPlanet, uViewPosPlanet, uTimePlanet;
+    private int uModelAtmos, uViewAtmos, uProjAtmos, uSunPosAtmos, uViewPosAtmos, uColorAtmos, uTimeAtmos, uPlanetCenterAtmos, uPlanetRadiusAtmos, uAtmosRadiusAtmos;
+    private int uModelPlatform, uViewPlatform, uProjPlatform, uTexPlatform, uSunPosPlatform, uViewPosPlatform, uTimePlatform;
+    private int uModelSun, uViewSun, uProjSun, uTimeSun;
+    private int uViewGrid, uProjGrid, uCamPosGrid;
+    private int uViewStar, uProjStar, uTimeStar;
 
     public void run() {
         init();
@@ -132,6 +140,10 @@ public class Simulation {
         return v;
     }
 
+    vec3 reinhard(vec3 x) {
+        return x / (1.0 + x);
+    }
+
     void main() {
         vec2 uv = TexCoord;
         vec2 flow = vec2(uTime * 0.01, uTime * 0.006);
@@ -151,19 +163,31 @@ public class Simulation {
         vec3 V = normalize(uViewPos - FragPos);
         vec3 H = normalize(L + V);
 
+        vec3 lightColor = vec3(1.0, 0.98, 0.92);
+        float lightIntensity = 1.1;
+
         float NdotL = max(dot(N, L), 0.0);
-        float ambient = 0.12;
+        float NdotV = max(dot(N, V), 0.0);
+        float NdotH = max(dot(N, H), 0.0);
+
+        float ambient = 0.05;
         float diffuse = NdotL;
-        float specPower = mix(48.0, 128.0, n1);
-        float spec = pow(max(dot(N, H), 0.0), specPower) * 0.35 * smoothstep(0.0, 1.0, NdotL);
-        float rim = pow(1.0 - max(dot(N, V), 0.0), 2.4) * 0.08;
 
-        vec3 lighting = albedo * (ambient + diffuse * 0.95);
-        lighting += vec3(1.0, 0.95, 0.85) * spec;
-        lighting += albedo * rim;
-        float shadowBoost = 0.05 * (1.0 - NdotL);
+        float specPower = mix(32.0, 96.0, n1);
+        float spec = pow(NdotH, specPower) * (specPower + 2.0) / 8.0;
+        spec *= smoothstep(0.0, 0.1, NdotL) * 0.3;
 
-        frag = vec4(lighting + shadowBoost, 1.0);
+        float rim = pow(1.0 - NdotV, 3.0) * 0.08 * NdotL;
+
+        vec3 lit = albedo * (ambient + diffuse * lightIntensity) * lightColor;
+        lit += lightColor * spec;
+        lit += albedo * rim * lightColor;
+
+        lit *= (0.97 + 0.03 * NdotL);
+
+        lit = reinhard(lit);
+
+        frag = vec4(lit, 1.0);
     }
     """;
 
@@ -179,19 +203,58 @@ public class Simulation {
     uniform vec3 uViewPos;
     uniform vec3 uAtmosphereColor;
     uniform float uTime;
+    uniform vec3 uPlanetCenter;
+    uniform float uPlanetRadius;
+    uniform float uAtmosphereRadius;
+
+    const float PI = 3.14159265359;
+
+    float rayleighPhase(float cosTheta) {
+        float cosThetaSq = cosTheta * cosTheta;
+        return (3.0 / (16.0 * PI)) * (1.0 + cosThetaSq);
+    }
+
+    float miePhase(float cosTheta, float g) {
+        float g2 = g * g;
+        float denom = 1.0 + g2 - 2.0 * g * cosTheta;
+        denom = max(denom, 0.001);
+        return (3.0 * (1.0 - g2)) / (2.0 * (2.0 + g2) * pow(denom, 1.5));
+    }
 
     void main() {
-        vec3 N = normalize(Normal);
-        vec3 V = normalize(uViewPos - FragPos);
-        vec3 L = normalize(uSunPos - FragPos);
+        vec3 viewDir = normalize(uViewPos - FragPos);
+        vec3 lightDir = normalize(uSunPos - FragPos);
+        vec3 planetSurfaceNormal = normalize(FragPos - uPlanetCenter);
 
-        float fresnel = pow(1.0 - max(dot(N, V), 0.0), 4.0);
-        float lightScatter = pow(max(dot(N, L), 0.0), 0.5);
-        float glow = fresnel * (0.7 + 0.8 * lightScatter);
-        float pulse = 0.94 + 0.06 * sin(uTime * 1.5);
+        float cosViewSurface = dot(viewDir, planetSurfaceNormal);
+        float cosLightSurface = dot(lightDir, planetSurfaceNormal);
+        float cosViewLight = dot(viewDir, lightDir);
 
-        vec3 color = uAtmosphereColor * glow * 2.6 * pulse;
-        frag = vec4(color, glow * 0.92);
+        cosViewLight = clamp(cosViewLight, -0.999, 0.999);
+
+        float altitude = length(FragPos - uPlanetCenter) - uPlanetRadius;
+        float atmosphereThickness = uAtmosphereRadius - uPlanetRadius;
+        float normalizedAltitude = clamp(altitude / atmosphereThickness, 0.0, 1.0);
+
+        float opticalDepthRayleigh = (1.0 - exp(-normalizedAltitude * 1.8)) * 0.65;
+        float opticalDepthMie = (1.0 - exp(-normalizedAltitude * 3.5)) * 0.45;
+
+        float rayleighAmount = opticalDepthRayleigh * rayleighPhase(cosViewLight);
+        float mieAmount = opticalDepthMie * miePhase(cosViewLight, 0.76);
+
+        float rimIntensity = pow(1.0 - abs(cosViewSurface), 2.2);
+        float glow = rimIntensity * 0.9 + rayleighAmount * 0.8 + mieAmount * 0.6;
+
+        vec3 rayleighColor = vec3(0.25, 0.5, 1.0);
+        vec3 mieColor = vec3(1.0, 0.9, 0.7);
+        vec3 baseColor = uAtmosphereColor;
+
+        vec3 scattered = mix(rayleighColor, baseColor, 0.6) * rayleighAmount;
+        scattered += mieColor * mieAmount;
+        scattered += baseColor * rimIntensity * 0.7;
+
+        float alpha = clamp(glow * 0.75, 0.0, 0.9);
+        frag = vec4(scattered * (0.95 + 0.05 * sin(uTime * 0.8)), alpha);
     }
     """;
 
@@ -622,26 +685,18 @@ public class Simulation {
     private void renderPlatform(float[] view, float[] proj, float time) {
         glUseProgram(platformProg);
 
-        int pModel = glGetUniformLocation(platformProg, "uModel");
-        int pView = glGetUniformLocation(platformProg, "uView");
-        int pProj = glGetUniformLocation(platformProg, "uProjection");
-        int pTex = glGetUniformLocation(platformProg, "uTexture");
-        int pSunPos = glGetUniformLocation(platformProg, "uSunPos");
-        int pViewPos = glGetUniformLocation(platformProg, "uViewPos");
-        int pTime = glGetUniformLocation(platformProg, "uTime");
-
-        glUniformMatrix4fv(pView, false, view);
-        glUniformMatrix4fv(pProj, false, proj);
-        glUniform3f(pSunPos, 0.0f, 0.0f, 0.0f);
-        glUniform3f(pViewPos, camX, camY, camZ);
-        glUniform1f(pTime, time);
+        glUniformMatrix4fv(uViewPlatform, false, view);
+        glUniformMatrix4fv(uProjPlatform, false, proj);
+        glUniform3f(uSunPosPlatform, 0.0f, 0.0f, 0.0f);
+        glUniform3f(uViewPosPlatform, camX, camY, camZ);
+        glUniform1f(uTimePlatform, time);
 
         float[] model = createModelMatrix(0, platformY, 0, 1.0f);
-        glUniformMatrix4fv(pModel, false, model);
+        glUniformMatrix4fv(uModelPlatform, false, model);
 
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, texPlatform);
-        glUniform1i(pTex, 0);
+        glUniform1i(uTexPlatform, 0);
 
         glBindVertexArray(platformVAO);
         glDrawElements(GL_TRIANGLES, platformIndexCount, GL_UNSIGNED_INT, 0);
@@ -650,51 +705,38 @@ public class Simulation {
     private void renderPlanet(float[] view, float[] proj, float time, int vao, int indexCount, int texture, float x, float z, float rotation, float scale) {
         glUseProgram(planetProg);
 
-        int pModel = glGetUniformLocation(planetProg, "uModel");
-        int pView = glGetUniformLocation(planetProg, "uView");
-        int pProj = glGetUniformLocation(planetProg, "uProjection");
-        int pTex = glGetUniformLocation(planetProg, "uTexture");
-        int pSunPos = glGetUniformLocation(planetProg, "uSunPos");
-        int pViewPos = glGetUniformLocation(planetProg, "uViewPos");
-        int pTime = glGetUniformLocation(planetProg, "uTime");
-
-        glUniformMatrix4fv(pView, false, view);
-        glUniformMatrix4fv(pProj, false, proj);
-        glUniform3f(pSunPos, 0.0f, 0.0f, 0.0f);
-        glUniform3f(pViewPos, camX, camY, camZ);
-        glUniform1f(pTime, time);
-        glUniformMatrix4fv(pModel, false, buildPlanetModel(x, z, rotation, scale));
+        glUniformMatrix4fv(uViewPlanet, false, view);
+        glUniformMatrix4fv(uProjPlanet, false, proj);
+        glUniform3f(uSunPosPlanet, 0.0f, 0.0f, 0.0f);
+        glUniform3f(uViewPosPlanet, camX, camY, camZ);
+        glUniform1f(uTimePlanet, time);
+        glUniformMatrix4fv(uModelPlanet, false, buildPlanetModel(x, z, rotation, scale));
 
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, texture);
-        glUniform1i(pTex, 0);
+        glUniform1i(uTexPlanet, 0);
 
         glBindVertexArray(vao);
         glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, 0);
     }
 
-    private void renderAtmosphere(float[] view, float[] proj, float time, int vao, int indexCount, float x, float z, float rotation, float scale, float r, float g, float b) {
+    private void renderAtmosphere(float[] view, float[] proj, float time, int vao, int indexCount, float x, float z, float rotation, float planetScale, float atmosphereScale, float r, float g, float b) {
         glUseProgram(atmosphereProg);
-
-        int aModel = glGetUniformLocation(atmosphereProg, "uModel");
-        int aView = glGetUniformLocation(atmosphereProg, "uView");
-        int aProj = glGetUniformLocation(atmosphereProg, "uProjection");
-        int aSunPos = glGetUniformLocation(atmosphereProg, "uSunPos");
-        int aViewPos = glGetUniformLocation(atmosphereProg, "uViewPos");
-        int aColor = glGetUniformLocation(atmosphereProg, "uAtmosphereColor");
-        int aTime = glGetUniformLocation(atmosphereProg, "uTime");
 
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE);
         glDepthMask(false);
 
-        glUniformMatrix4fv(aView, false, view);
-        glUniformMatrix4fv(aProj, false, proj);
-        glUniform3f(aSunPos, 0.0f, 0.0f, 0.0f);
-        glUniform3f(aViewPos, camX, camY, camZ);
-        glUniform3f(aColor, r, g, b);
-        glUniform1f(aTime, time);
-        glUniformMatrix4fv(aModel, false, buildPlanetModel(x, z, rotation, scale));
+        glUniformMatrix4fv(uViewAtmos, false, view);
+        glUniformMatrix4fv(uProjAtmos, false, proj);
+        glUniform3f(uSunPosAtmos, 0.0f, 0.0f, 0.0f);
+        glUniform3f(uViewPosAtmos, camX, camY, camZ);
+        glUniform3f(uColorAtmos, r, g, b);
+        glUniform1f(uTimeAtmos, time);
+        glUniform3f(uPlanetCenterAtmos, x, 0.0f, z);
+        glUniform1f(uPlanetRadiusAtmos, planetScale);
+        glUniform1f(uAtmosRadiusAtmos, atmosphereScale);
+        glUniformMatrix4fv(uModelAtmos, false, buildPlanetModel(x, z, rotation, atmosphereScale));
 
         glBindVertexArray(vao);
         glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, 0);
@@ -799,6 +841,54 @@ public class Simulation {
         gridProg = compileProgram(VERT_GRID, FRAG_GRID, "Grid");
         starProg = compileProgram(VERT_STAR, FRAG_STAR, "Stars");
 
+        glUseProgram(planetProg);
+        uModelPlanet = glGetUniformLocation(planetProg, "uModel");
+        uViewPlanet = glGetUniformLocation(planetProg, "uView");
+        uProjPlanet = glGetUniformLocation(planetProg, "uProjection");
+        uTexPlanet = glGetUniformLocation(planetProg, "uTexture");
+        uSunPosPlanet = glGetUniformLocation(planetProg, "uSunPos");
+        uViewPosPlanet = glGetUniformLocation(planetProg, "uViewPos");
+        uTimePlanet = glGetUniformLocation(planetProg, "uTime");
+
+        glUseProgram(atmosphereProg);
+        uModelAtmos = glGetUniformLocation(atmosphereProg, "uModel");
+        uViewAtmos = glGetUniformLocation(atmosphereProg, "uView");
+        uProjAtmos = glGetUniformLocation(atmosphereProg, "uProjection");
+        uSunPosAtmos = glGetUniformLocation(atmosphereProg, "uSunPos");
+        uViewPosAtmos = glGetUniformLocation(atmosphereProg, "uViewPos");
+        uColorAtmos = glGetUniformLocation(atmosphereProg, "uAtmosphereColor");
+        uTimeAtmos = glGetUniformLocation(atmosphereProg, "uTime");
+        uPlanetCenterAtmos = glGetUniformLocation(atmosphereProg, "uPlanetCenter");
+        uPlanetRadiusAtmos = glGetUniformLocation(atmosphereProg, "uPlanetRadius");
+        uAtmosRadiusAtmos = glGetUniformLocation(atmosphereProg, "uAtmosphereRadius");
+
+        glUseProgram(platformProg);
+        uModelPlatform = glGetUniformLocation(platformProg, "uModel");
+        uViewPlatform = glGetUniformLocation(platformProg, "uView");
+        uProjPlatform = glGetUniformLocation(platformProg, "uProjection");
+        uTexPlatform = glGetUniformLocation(platformProg, "uTexture");
+        uSunPosPlatform = glGetUniformLocation(platformProg, "uSunPos");
+        uViewPosPlatform = glGetUniformLocation(platformProg, "uViewPos");
+        uTimePlatform = glGetUniformLocation(platformProg, "uTime");
+
+        glUseProgram(sunProg);
+        uModelSun = glGetUniformLocation(sunProg, "uModel");
+        uViewSun = glGetUniformLocation(sunProg, "uView");
+        uProjSun = glGetUniformLocation(sunProg, "uProjection");
+        uTimeSun = glGetUniformLocation(sunProg, "uTime");
+
+        glUseProgram(gridProg);
+        uViewGrid = glGetUniformLocation(gridProg, "uView");
+        uProjGrid = glGetUniformLocation(gridProg, "uProjection");
+        uCamPosGrid = glGetUniformLocation(gridProg, "uCamPos");
+
+        glUseProgram(starProg);
+        uViewStar = glGetUniformLocation(starProg, "uView");
+        uProjStar = glGetUniformLocation(starProg, "uProjection");
+        uTimeStar = glGetUniformLocation(starProg, "uTime");
+
+        glUseProgram(0);
+
         startTime = glfwGetTime();
 
         glfwSetKeyCallback(window, (win, key, sc, action, mods) -> {
@@ -848,15 +938,6 @@ public class Simulation {
     private void loop() {
         glClearColor(0.0f, 0.0f, 0.02f, 1.0f);
 
-        int gView = glGetUniformLocation(gridProg, "uView");
-        int gProj = glGetUniformLocation(gridProg, "uProjection");
-        int gCamPos = glGetUniformLocation(gridProg, "uCamPos");
-
-        int sModel = glGetUniformLocation(sunProg, "uModel");
-        int sView = glGetUniformLocation(sunProg, "uView");
-        int sProj = glGetUniformLocation(sunProg, "uProjection");
-        int sTime = glGetUniformLocation(sunProg, "uTime");
-
         double prev = glfwGetTime();
 
         while (!glfwWindowShouldClose(window)) {
@@ -870,10 +951,12 @@ public class Simulation {
             musRotation += dt * 0.8;
             kasRotation += dt * 0.5;
 
-            musX = (float) (Math.cos(orbitAngleMus) * 9.0);
-            musZ = (float) (Math.sin(orbitAngleMus) * 9.0);
-            kasX = (float) (Math.cos(orbitAngleKas) * 16.5);
-            kasZ = (float) (Math.sin(orbitAngleKas) * 16.5);
+            float orbitRadiusMus = 12.0f;
+            float orbitRadiusKas = 22.0f;
+            musX = (float) (Math.cos(orbitAngleMus) * orbitRadiusMus);
+            musZ = (float) (Math.sin(orbitAngleMus) * orbitRadiusMus);
+            kasX = (float) (Math.cos(orbitAngleKas) * orbitRadiusKas);
+            kasZ = (float) (Math.sin(orbitAngleKas) * orbitRadiusKas);
 
             float speed = 10.0f * dt;
             float fwdX = (float) Math.sin(yaw), fwdZ = -(float) Math.cos(yaw);
@@ -907,27 +990,31 @@ public class Simulation {
             renderStars(starView, proj, t);
 
             glUseProgram(gridProg);
-            glUniformMatrix4fv(gView, false, view);
-            glUniformMatrix4fv(gProj, false, proj);
-            glUniform3f(gCamPos, camX, camY, camZ);
+            glUniformMatrix4fv(uViewGrid, false, view);
+            glUniformMatrix4fv(uProjGrid, false, proj);
+            glUniform3f(uCamPosGrid, camX, camY, camZ);
             glBindVertexArray(gridVAO);
             glDrawElements(GL_LINES, gridIndexCount, GL_UNSIGNED_INT, 0);
 
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(GL_LESS);
+            glDepthMask(true);
+
             glUseProgram(sunProg);
-            glUniformMatrix4fv(sView, false, view);
-            glUniformMatrix4fv(sProj, false, proj);
-            glUniform1f(sTime, t);
-            glUniformMatrix4fv(sModel, false, createModelMatrix(0, 0, 0, 2.0f));
+            glUniformMatrix4fv(uViewSun, false, view);
+            glUniformMatrix4fv(uProjSun, false, proj);
+            glUniform1f(uTimeSun, t);
+            glUniformMatrix4fv(uModelSun, false, createModelMatrix(0, 0, 0, 2.0f));
             glBindVertexArray(sunVAO);
             glDrawElements(GL_TRIANGLES, sunIndexCount, GL_UNSIGNED_INT, 0);
 
             renderPlatform(view, proj, t);
 
             renderPlanet(view, proj, t, mustafarVAO, mustafarIndexCount, texMustafar, musX, musZ, musRotation, 1.55f);
-            renderAtmosphere(view, proj, t, mustafarVAO, mustafarIndexCount, musX, musZ, musRotation, 1.68f, 1.0f, 0.12f, 0.04f);
+            renderAtmosphere(view, proj, t, mustafarVAO, mustafarIndexCount, musX, musZ, musRotation, 1.55f, 1.68f, 1.0f, 0.12f, 0.04f);
 
             renderPlanet(view, proj, t, kashyyykVAO, kashyyykIndexCount, texKashyyyk, kasX, kasZ, kasRotation, 1.75f);
-            renderAtmosphere(view, proj, t, kashyyykVAO, kashyyykIndexCount, kasX, kasZ, kasRotation, 1.90f, 0.18f, 0.48f, 1.0f);
+            renderAtmosphere(view, proj, t, kashyyykVAO, kashyyykIndexCount, kasX, kasZ, kasRotation, 1.75f, 1.90f, 0.18f, 0.48f, 1.0f);
 
             glBindVertexArray(0);
             glfwSwapBuffers(window);
@@ -938,18 +1025,14 @@ public class Simulation {
     private void renderStars(float[] view, float[] proj, float time) {
         glUseProgram(starProg);
 
-        int sView = glGetUniformLocation(starProg, "uView");
-        int sProj = glGetUniformLocation(starProg, "uProjection");
-        int sTime = glGetUniformLocation(starProg, "uTime");
-
         glDisable(GL_DEPTH_TEST);
         glDepthMask(false);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE);
 
-        glUniformMatrix4fv(sView, false, view);
-        glUniformMatrix4fv(sProj, false, proj);
-        glUniform1f(sTime, time);
+        glUniformMatrix4fv(uViewStar, false, view);
+        glUniformMatrix4fv(uProjStar, false, proj);
+        glUniform1f(uTimeStar, time);
 
         glBindVertexArray(starVAO);
         glDrawArrays(GL_POINTS, 0, starCount);
@@ -960,133 +1043,48 @@ public class Simulation {
     }
 
     private float[] buildPlanetModel(float x, float z, float rotation, float scale) {
-        float c = (float) Math.cos(rotation) * scale;
-        float s = (float) Math.sin(rotation) * scale;
-
-        float[] m = new float[16];
-        m[0] = c;
-        m[1] = 0;
-        m[2] = -s;
-        m[3] = 0;
-        m[4] = 0;
-        m[5] = scale;
-        m[6] = 0;
-        m[7] = 0;
-        m[8] = s;
-        m[9] = 0;
-        m[10] = c;
-        m[11] = 0;
-        m[12] = x;
-        m[13] = 0;
-        m[14] = z;
-        m[15] = 1;
-        return m;
-    }
+    float[] m = new float[16];
+    new Matrix4f().translate(x, 0.0f, z).rotateY(rotation).scale(scale).get(m);
+    return m;
+}
 
     private float[] createViewMatrix() {
-        float cosPitch = (float) Math.cos(pitch);
-        float sinPitch = (float) Math.sin(pitch);
-        float cosYaw = (float) Math.cos(yaw);
-        float sinYaw = (float) Math.sin(yaw);
+    float[] v = new float[16];
+    float fwdX = (float) (Math.sin(yaw) * Math.cos(pitch));
+    float fwdY = (float) Math.sin(pitch);
+    float fwdZ = (float) (-Math.cos(yaw) * Math.cos(pitch));
+    new Matrix4f().lookAt(
+        camX, camY, camZ,
+        camX + fwdX, camY + fwdY, camZ + fwdZ,
+        0.0f, 1.0f, 0.0f
+    ).get(v);
+    return v;
+}
 
-        float[] fwd = {
-            sinYaw * cosPitch,
-            sinPitch,
-            -cosYaw * cosPitch
-        };
+private float[] createStarViewMatrix() {
+    float[] v = new float[16];
+    float fwdX = (float) (Math.sin(yaw) * Math.cos(pitch));
+    float fwdY = (float) Math.sin(pitch);
+    float fwdZ = (float) (-Math.cos(yaw) * Math.cos(pitch));
+    new Matrix4f().lookAt(
+        0.0f, 0.0f, 0.0f,
+        fwdX, fwdY, fwdZ,
+        0.0f, 1.0f, 0.0f
+    ).get(v);
+    return v;
+}
 
-        float[] right = { cosYaw, 0f, sinYaw };
+private float[] createProjectionMatrix() {
+    float[] p = new float[16];
+    new Matrix4f().perspective(FOV, (float) WIDTH / HEIGHT, 0.1f, 200.0f).get(p);
+    return p;
+}
 
-        float[] up = {
-            right[1] * fwd[2] - right[2] * fwd[1],
-            right[2] * fwd[0] - right[0] * fwd[2],
-            right[0] * fwd[1] - right[1] * fwd[0]
-        };
-
-        float[] v = new float[16];
-        v[0] = right[0];
-        v[4] = right[1];
-        v[8] = right[2];
-        v[1] = up[0];
-        v[5] = up[1];
-        v[9] = up[2];
-        v[2] = -fwd[0];
-        v[6] = -fwd[1];
-        v[10] = -fwd[2];
-        v[3] = 0;
-        v[7] = 0;
-        v[11] = 0;
-        v[12] = -(right[0] * camX + right[1] * camY + right[2] * camZ);
-        v[13] = -(up[0] * camX + up[1] * camY + up[2] * camZ);
-        v[14] = (fwd[0] * camX + fwd[1] * camY + fwd[2] * camZ);
-        v[15] = 1;
-        return v;
-    }
-
-    private float[] createStarViewMatrix() {
-        float cosPitch = (float) Math.cos(pitch);
-        float sinPitch = (float) Math.sin(pitch);
-        float cosYaw = (float) Math.cos(yaw);
-        float sinYaw = (float) Math.sin(yaw);
-
-        float[] fwd = {
-            sinYaw * cosPitch,
-            sinPitch,
-            -cosYaw * cosPitch
-        };
-
-        float[] right = { cosYaw, 0f, sinYaw };
-
-        float[] up = {
-            right[1] * fwd[2] - right[2] * fwd[1],
-            right[2] * fwd[0] - right[0] * fwd[2],
-            right[0] * fwd[1] - right[1] * fwd[0]
-        };
-
-        float[] v = new float[16];
-        v[0] = right[0];
-        v[4] = right[1];
-        v[8] = right[2];
-        v[1] = up[0];
-        v[5] = up[1];
-        v[9] = up[2];
-        v[2] = -fwd[0];
-        v[6] = -fwd[1];
-        v[10] = -fwd[2];
-        v[3] = 0;
-        v[7] = 0;
-        v[11] = 0;
-        v[12] = 0;
-        v[13] = 0;
-        v[14] = 0;
-        v[15] = 1;
-        return v;
-    }
-
-    private float[] createProjectionMatrix() {
-        float aspect = (float) WIDTH / HEIGHT;
-        float near = 0.1f, far = 200.0f;
-        float tanHalfFOV = (float) Math.tan(FOV / 2.0);
-        float[] p = new float[16];
-        p[0] = 1.0f / (aspect * tanHalfFOV);
-        p[5] = 1.0f / tanHalfFOV;
-        p[10] = -(far + near) / (far - near);
-        p[11] = -1;
-        p[14] = -(2.0f * far * near) / (far - near);
-        return p;
-    }
-
-    private float[] createModelMatrix(float x, float y, float z, float scale) {
-        float[] m = new float[16];
-        m[0] = scale;
-        m[5] = scale;
-        m[10] = scale;
-        m[15] = 1;
-        m[12] = x;
-        m[13] = y;
-        m[14] = z;
-        return m;
-    }
+private float[] createModelMatrix(float x, float y, float z, float scale) {
+    float[] m = new float[16];
+    new Matrix4f().translate(x, y, z).scale(scale).get(m);
+    return m;
+}
 
     private void initAudio() {
         try {
